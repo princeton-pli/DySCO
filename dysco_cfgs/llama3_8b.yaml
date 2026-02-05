@@ -1,0 +1,19 @@
+dysco_qrheads: "[(17,24),(14,31),(17,26),(16,19),(16,25),(13,1),(14,22),(13,16),(14,20),(14,3),(14,1),(17,27),(16,26),(17,21),(16,27),(19,3)]"
+dysco_top_k: 4096
+dysco_top_p: 0.975
+dysco_strength: 2.0
+dysco_ctx_momentum: 0.4
+dysco_ctx_warmup: 8
+dysco_interv_warmup: 'auto'
+dysco_rescale_template: False
+
+# model related constants 
+dysco_template_seqs:
+  - [128000]      # <|begin_of_text|>
+  - [128006, 9125, 128007, 271]      # <|start_header_id|>system<|end_header_id|>\n\n
+  - [128009, 128006, 882, 128007, 271]       # <|eot_id|><|start_header_id|>user<|end_header_id|>\n\n
+  - [128009, 128006, 78191, 128007, 271]     # <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+  - [128009, 128006, 271, 128007, 271]  # <think>\n\n</think>\n\n
+
+# for ablation
+dysco_static_rescaling: False

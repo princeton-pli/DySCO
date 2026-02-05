@@ -1,0 +1,18 @@
+dysco_qrheads: "[(48,31),(48,26),(48,4),(48,30),(47,9),(48,37),(45,62),(52,7),(48,46),(48,1),(51,53),(47,48),(48,56),(50,29),(48,25),(50,36),(53,33),(47,1),(52,33),(47,52),(52,36),(50,20),(45,30),(50,59),(45,4),(49,57),(46,62),(45,26),(51,6),(50,33),(48,2),(47,51)]"
+dysco_top_k: 4096
+dysco_top_p: 0.975
+dysco_strength: 2.0
+dysco_ctx_momentum: 0.4
+dysco_ctx_warmup: 8
+dysco_interv_warmup: 'auto'
+dysco_rescale_template: False
+
+# model related constants 
+dysco_template_seqs:
+  - [151644, 8948, 198]      # <|im_start|>system\n
+  - [151644, 872, 198]       # <|im_start|>user\n
+  - [151644, 77091, 198]     # <|im_start|>assistant\n
+  - [151667, 271, 151668, 271]  # <think>\n\n</think>\n\n
+
+# for ablation
+dysco_static_rescaling: False

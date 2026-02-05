@@ -1,0 +1,18 @@
+dysco_qrheads: "[(21,31),(21,18),(20,15),(22,4),(21,11),(20,16),(21,17),(19,13),(21,10),(21,8),(18,5),(20,14),(19,14),(24,13),(17,4),(19,28)]"
+dysco_top_k: 4096
+dysco_top_p: 0.975
+dysco_strength: 2.0
+dysco_ctx_momentum: 0.4
+dysco_ctx_warmup: 8
+dysco_interv_warmup: 'auto'
+dysco_rescale_template: False
+
+# model related constants 
+dysco_template_seqs:
+  - [151644, 8948, 198]      # <|im_start|>system\n
+  - [151644, 872, 198]       # <|im_start|>user\n
+  - [151644, 77091, 198]     # <|im_start|>assistant\n
+  - [151667, 271, 151668, 271]  # <think>\n\n</think>\n\n
+
+# for ablation
+dysco_static_rescaling: False

@@ -201,6 +201,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Evaluation data (downloaded via prepare_data.sh)
+data_eval/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
