@@ -1,0 +1,17 @@
+selected_heads: "[(17,24),(14,31),(17,26),(16,19),(16,25),(13,1),(14,22),(13,16),(14,20),(14,3),(14,1),(17,27),(16,26),(17,21),(16,27),(19,3)]"
+top_k: 4096
+top_p: 0.975
+strength: 2.0
+decay_factor: 0.75
+context_warmup_steps: 8
+intervention_warmup: 'auto'
+scale_template_tokens: False
+
+# model related constants
+template_sequences:
+  - [128000]      # <|begin_of_text|>
+  - [128006, 9125, 128007, 271]      # <|start_header_id|>system<|end_header_id|>\n\n
+  - [128009, 128006, 882, 128007, 271]       # <|eot_id|><|start_header_id|>user<|end_header_id|>\n\n
+  - [128009, 128006, 78191, 128007, 271]     # <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+
+dynamic_rescale: True

@@ -1,0 +1,17 @@
+selected_heads: "[(20,15),(21,18),(21,31),(22,4),(21,11),(24,29),(21,10),(20,16),(21,8),(21,17),(23,30),(20,14),(20,13),(24,13),(20,4),(18,19)]"
+top_k: 4096
+top_p: 0.975
+strength: 2.0
+decay_factor: 0.75
+context_warmup_steps: 8
+intervention_warmup: 'auto'
+scale_template_tokens: False
+
+# model related constants
+template_sequences:
+  - [151644, 8948, 198]      # <|im_start|>system\n
+  - [151644, 872, 198]       # <|im_start|>user\n
+  - [151644, 77091, 198]     # <|im_start|>assistant\n
+  - [151667, 271, 151668, 271]  # <think>\n\n</think>\n\n
+
+dynamic_rescale: True
