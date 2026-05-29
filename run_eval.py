@@ -13,6 +13,7 @@ from transformers import (
     AutoTokenizer,
     AutoConfig,
     LlamaForCausalLM,
+    MixtralForCausalLM,
     Qwen3ForCausalLM,
     Qwen3MoeForCausalLM,
 )
@@ -20,6 +21,7 @@ from transformers import (
 from data_utils import load_eval_data
 from dysco.custom_mixin import RescaleConfig
 from dysco.custom_modeling_llama import RescaleLlamaForCausalLM
+from dysco.custom_modeling_mixtral import RescaleMixtralForCausalLM
 from dysco.custom_modeling_qwen3 import RescaleQwen3ForCausalLM
 from dysco.custom_modeling_qwen3_moe import RescaleQwen3MoeForCausalLM
 
@@ -28,6 +30,7 @@ _TOKENIZER_FOR_FILTERING = "models/Llama-3.1-8B-Instruct"
 # Maps HF model_type -> (BaseClass, RescaleClass)
 _MODEL_CLASSES = {
     "llama":     (LlamaForCausalLM,     RescaleLlamaForCausalLM),
+    "mixtral":   (MixtralForCausalLM,   RescaleMixtralForCausalLM),
     "qwen3_moe": (Qwen3MoeForCausalLM,  RescaleQwen3MoeForCausalLM),
     "qwen3":     (Qwen3ForCausalLM,     RescaleQwen3ForCausalLM),
 }
@@ -81,6 +84,8 @@ def _parse_args():
     parser.add_argument("--dysco_interv_warmup", type=str, default=None, help="intervention warmup")
     parser.add_argument("--dysco_rescale_template", action="store_true", default=False, help="rescale template")
     parser.add_argument("--dysco_static_rescaling", action="store_true", default=False, help="static rescaling")
+    parser.add_argument("--use_fa_decode", action="store_true", default=False,
+                        help="run the DySCO attention intervention through FlashAttention instead of eager")
 
     # attnsharp
     parser.add_argument("--attention_logits_temperature", type=float, default=None)
@@ -97,8 +102,7 @@ def hash8(s):
 
 
 def get_output_path(args, rescale_config=None):
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     if args.decoding_method == "flash":
         output_filename = (
@@ -127,6 +131,7 @@ def get_output_path(args, rescale_config=None):
             f"_ctxwarm{cfg.context_warmup_steps}intwarm{cfg.intervention_warmup_steps}"
             f"scaletemp{args.dysco_rescale_template}"
             f"_think{args.think}_{args.seed}and{args.generation_seed}"
+            f"_fa{args.use_fa_decode}"
             f"_testsz{args.test_size}.json"
         )
     else:
@@ -139,7 +144,7 @@ def detect_model_type(model_path):
     config = AutoConfig.from_pretrained(model_path)
     model_type = config.model_type.lower()
     # Match against known types (order matters: qwen3_moe before qwen3)
-    for key in ["llama", "qwen3_moe", "qwen3"]:
+    for key in ["llama", "mixtral", "qwen3_moe", "qwen3"]:
         if key in model_type:
             return key
     raise ValueError(f"Unsupported model type: {model_type}")
@@ -251,9 +256,30 @@ def filter_dataset_by_length(args, dataset):
     return new_dataset
 
 
+def _coalesce_same_role(messages, sep="\n\n"):
+    """Merge consecutive messages with the same role.
+
+    Why: Mixtral's chat template strictly enforces user/assistant alternation
+    and raises a TemplateError otherwise. MRCR data has two consecutive user
+    messages at the start (long context + final query), which works on Llama/Qwen
+    chat templates but breaks on Mixtral.
+    """
+    if not messages:
+        return messages
+    merged = [dict(messages[0])]
+    for m in messages[1:]:
+        if m["role"] == merged[-1]["role"]:
+            merged[-1]["content"] = merged[-1]["content"] + sep + m["content"]
+        else:
+            merged.append(dict(m))
+    return merged
+
+
 def prepare_input_ids(ex, tokenizer, model_type, use_chat_template, think):
     if isinstance(ex["input_prompt"], list):
         input_prompt = ex["input_prompt"]
+        if "mixtral" in model_type:
+            input_prompt = _coalesce_same_role(input_prompt)
         if "qwen3" in model_type:
             input_ids = tokenizer.apply_chat_template(
                 input_prompt, tokenize=True, add_generation_prompt=True,
@@ -369,6 +395,7 @@ def run_rescale_generation(args, model, tokenizer, dataset, model_type,
 
         decoding_kwargs = get_decoding_kwargs(args, model_type)
         decoding_kwargs["rescale_config"] = rescale_config
+        decoding_kwargs["use_fa_decode"] = args.use_fa_decode
         if args.stop_on_newline:
             decoding_kwargs["eos_token_id"] = stop_token_ids
 
@@ -445,6 +472,18 @@ def main():
     print(f"Detected model type: {model_type}")
     BaseModelClass, RescaleModelClass = _MODEL_CLASSES[model_type]
 
+    # --use_fa_decode only updates the dispatch in custom_modeling_qwen3.py;
+    # Llama / Mixtral / Qwen3-MoE attention modules do not check the flag and
+    # would silently fall back to eager while the output filename still records
+    # _faTrue. Fail loudly instead of producing misleading results.
+    if args.use_fa_decode and model_type != "qwen3":
+        raise ValueError(
+            f"--use_fa_decode is currently supported only on Qwen3 dense models, "
+            f"got model_type={model_type!r}. Mirror the dispatch / cache / rollback "
+            f"changes from custom_modeling_qwen3.py to custom_modeling_{model_type}.py "
+            f"to enable."
+        )
+
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
@@ -467,7 +506,7 @@ def main():
 
     # Load and filter data
     dataset, eval_func = load_eval_data(args.dataset)
-    if not args.dataset.startswith("mrcr") and not args.dataset.startswith("graphwalks") and not args.dataset.startswith("clipper"):
+    if not args.dataset.startswith("mrcr") and not args.dataset.startswith("graphwalks") and not args.dataset.startswith("clipper") and not args.dataset.startswith("oolong") and not args.dataset.startswith("rulerv2"):
         dataset = filter_dataset_by_length(args, dataset)
     print(f"Dataset size: {len(dataset)}")
     if args.test_size > 0:
@@ -496,6 +535,11 @@ def main():
             rescale_config)
     elif args.decoding_method == "attnsharp":
         outputs = run_attnsharp_generation(args, model, tokenizer, dataset, model_type)
+
+    # Average end-to-end latency per sample (wall clock: prefill + decode + detok)
+    per_sample_latency = [o["time_taken"] for o in outputs]
+    avg_latency = float(np.mean(per_sample_latency)) if per_sample_latency else 0.0
+    print(f"AVG LATENCY: {avg_latency:.3f} s/sample over {len(per_sample_latency)} samples")
 
     # Evaluate
     all_metrics = []
@@ -531,13 +575,14 @@ def main():
             "args": args.__dict__,
             "saving_info": saving_info,
             "test_size": len(dataset),
+            "avg_latency_sec": avg_latency,
         }
         with open(output_path, "w") as f:
             json.dump(output_content, f, indent=2)
         return
 
-    # CLIPPER paired evaluation
-    if "clipper" in args.dataset:
+    # CLIPPER paired evaluation (eval sets only, not train sets)
+    if "clipper" in args.dataset and "clipper_train" not in args.dataset:
         assert len(all_metrics) % 2 == 0
         num_pairs = len(all_metrics) // 2
         paired_correct = sum(
@@ -558,11 +603,12 @@ def main():
         "saving_info": saving_info,
         "avg_metrics": avg_metrics,
         "test_size": len(dataset),
+        "avg_latency_sec": avg_latency,
     }
     with open(output_path, "w") as f:
         json.dump(output_content, f, indent=2)
     with open(output_path.replace(".json", "scores.json"), "w") as f:
-        json.dump(avg_metrics, f, indent=2)
+        json.dump({**avg_metrics, "avg_latency_sec": avg_latency}, f, indent=2)
 
 
 if __name__ == "__main__":

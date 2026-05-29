@@ -25,6 +25,8 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from .fa_intervention import fa_intervention_attention_forward, fa_spec_attention_forward
+
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
@@ -130,6 +132,10 @@ def eager_attention_forward(
 
     # Apply intervention vector for rescaling attention
     if attention_logits_intervention_vector is not None:
+        # Defensive: under device_map="auto" accelerate should migrate the
+        # kwarg via layer pre-hook, but enforce same-device explicitly.
+        if attention_logits_intervention_vector.device != attn_weights.device:
+            attention_logits_intervention_vector = attention_logits_intervention_vector.to(attn_weights.device)
         attn_weights = attn_weights + attention_logits_intervention_vector
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -192,27 +198,60 @@ class RescaleQwen3Attention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # Pop FA-path kwargs early so cache handling can branch on them.
+        use_fa_decode = kwargs.pop("use_fa_decode", False)
+        qrhead_indices_in_layer_dict = kwargs.pop("qrhead_indices_in_layer_dict", None)
+        qrhead_snapshot_buffer = kwargs.pop("qrhead_snapshot_buffer", None)
+        is_fa_spec_pass = use_fa_decode and skip_update_past_key_value
+        wants_qrhead_snapshot = (
+            use_fa_decode
+            and qrhead_indices_in_layer_dict is not None
+            and qrhead_snapshot_buffer is not None
+        )
+
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if is_fa_spec_pass:
+                # Build a local "cache + new token" view for this
+                # attention computation only; the actual cache stays untouched
+                # (no append + no later rollback needed).
+                cache_K = past_key_values.layers[self.layer_idx].keys
+                cache_V = past_key_values.layers[self.layer_idx].values
+                key_states = torch.cat([cache_K, key_states], dim=-2)
+                value_states = torch.cat([cache_V, value_states], dim=-2)
+            else:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
-        # Fall back to eager attention when:
-        # 1. Using intervention vector for rescaling
-        # 2. Skip update past key value (speculative decoding)
-        # 3. output_attentions=True (flash attention doesn't support returning attention weights)
         output_attentions = kwargs.get("output_attentions", False)
-        if (self.config._attn_implementation != "eager" and
-            attention_logits_intervention_vector is None and
-            not skip_update_past_key_value and
-            not output_attentions):
+        # Dispatch:
+        # - intervention + use_fa_decode   -> FA via augmented-dim trick
+        # - use_fa_decode + snapshot kwargs -> FA + QRHead snapshot (spec pass / warmup)
+        # - no intervention / spec pass / output_attentions -> vanilla FA when available
+        # - everything else (incl. intervention with flag off) -> eager fallback
+        if attention_logits_intervention_vector is not None and use_fa_decode:
+            attention_interface = fa_intervention_attention_forward
+        elif wants_qrhead_snapshot:
+            attention_interface = fa_spec_attention_forward
+        elif (self.config._attn_implementation != "eager" and
+              attention_logits_intervention_vector is None and
+              not skip_update_past_key_value and
+              not output_attentions):
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attention_logits_temperature = kwargs.get("attention_logits_temperature", None)
         if attention_logits_temperature is not None:
             key_states = key_states / math.sqrt(attention_logits_temperature)
             query_states = query_states / math.sqrt(attention_logits_temperature)
+
+        # Per-layer snapshot kwargs only when the interface accepts them.
+        extra_interface_kwargs = {}
+        if attention_interface is fa_spec_attention_forward:
+            extra_interface_kwargs["qrhead_indices_in_layer"] = (
+                qrhead_indices_in_layer_dict.get(self.layer_idx) if qrhead_indices_in_layer_dict else None
+            )
+            extra_interface_kwargs["qrhead_snapshot_buffer"] = qrhead_snapshot_buffer
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -224,14 +263,17 @@ class RescaleQwen3Attention(nn.Module):
             scaling=self.scaling,
             sliding_window=self.sliding_window,  # diff with Llama
             attention_logits_intervention_vector=attention_logits_intervention_vector,
+            **extra_interface_kwargs,
             **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        # Rollback cache update if requested (for speculative decoding/rescaling)
-        if skip_update_past_key_value and past_key_values is not None:
+        # Rollback cache update if requested (for speculative decoding/rescaling).
+        # Only the legacy update-based path needs this; the FA cat path never
+        # mutated the cache, so no rollback is required there.
+        if skip_update_past_key_value and past_key_values is not None and not is_fa_spec_pass:
             # Remove the last token from the cache (undo the update)
             past_key_values.layers[self.layer_idx].keys = past_key_values.layers[self.layer_idx].keys[:, :, :-1]
             past_key_values.layers[self.layer_idx].values = past_key_values.layers[self.layer_idx].values[:, :, :-1]

@@ -131,6 +131,10 @@ def _build_intervention_vector(selected_mask, reference_tensor, strength, non_te
         dtype: explicit dtype for the output tensor; when None inherits from reference_tensor
     """
     if non_template_mask is not None and 0 < strength < 99.0:
+        # non_template_mask is built on input_ids.device; selected_mask may
+        # live on a different GPU under device_map="auto". Migrate before &.
+        if non_template_mask.device != selected_mask.device:
+            non_template_mask = non_template_mask.to(selected_mask.device)
         if selected_mask.shape[1] < non_template_mask.shape[1]:
             selected_mask = selected_mask & non_template_mask[:, :selected_mask.shape[1]]
         else:
@@ -192,18 +196,42 @@ def _select_important_tokens(importance, generation_logging, selection_method, t
 
 
 def _apply_importance_decay(cur_importance, past_importance, decay_factor):
-    """Blend current attention importance with past via decay, then normalize."""
+    """Blend current attention importance with past via decay, then normalize.
+
+    past_importance is initialized on input_ids.device (typically GPU 0) but
+    cur_importance comes from aggregated attention which may live on another
+    GPU under device_map="auto"; migrate before the in-place add.
+    """
+    if past_importance.device != cur_importance.device:
+        past_importance = past_importance.to(cur_importance.device)
     cur_importance[:, :-1] += past_importance * decay_factor
     cur_importance = cur_importance / torch.sum(cur_importance, dim=1)
     return cur_importance
 
 
 def _aggregate_head_attention(attention_outputs, selected_heads):
-    """Extract and average attention weights across selected (layer, head) pairs."""
-    per_head = []
-    for layer, head in selected_heads:
-        per_head.append(attention_outputs[layer][:, head,])
+    """Extract and average attention weights across selected (layer, head) pairs.
+
+    With device_map="auto" the selected layers may live on different GPUs;
+    migrate each selected attention to the first selected layer's device
+    before stacking, otherwise torch.stack errors across devices.
+    """
+    target_device = attention_outputs[selected_heads[0][0]].device
+    per_head = [attention_outputs[layer][:, head,].to(target_device) for layer, head in selected_heads]
     return torch.stack(per_head, dim=0).mean(dim=0).squeeze(1)
+
+
+def _aggregate_from_snapshot(snapshot_buffer, selected_heads):
+    """Average snapshot vectors across selected (layer, head) pairs.
+
+    Each snapshot entry is (B, L_k) -- per-head attention from the new query
+    to all keys. Output shape (B, L_k), matching _aggregate_head_attention.
+    Handles device_map="auto" by migrating each entry to the first selected
+    layer's device before stacking.
+    """
+    target_device = snapshot_buffer[selected_heads[0]].device
+    per_head = [snapshot_buffer[(layer, head)].to(target_device) for layer, head in selected_heads]
+    return torch.stack(per_head, dim=0).mean(dim=0)
 
 
 def obtain_template_sequence_mask(input_ids, template_sequences):
@@ -328,6 +356,10 @@ class CustomGenerationMixin(GenerationMixin):
         custom_generate: Optional[Union[str, Callable]] = None,
         rescale_config: Optional[RescaleConfig] = None,
         return_importance_details: bool = False,
+        # Route the DySCO real pass through FlashAttention (augmented-dim
+        # trick) instead of eager. Explicit param so it bypasses HF's
+        # _validate_model_kwargs. Default False = original eager behavior.
+        use_fa_decode: bool = False,
         # for baselines
         use_attnsharp: bool = False,
         attention_logits_temperature: Optional[float] = None,
@@ -634,6 +666,7 @@ class CustomGenerationMixin(GenerationMixin):
                 generation_config=generation_config,
                 rescale_config=rescale_config,
                 return_importance_details=return_importance_details,
+                use_fa_decode=use_fa_decode,
                 **generation_mode_kwargs,
                 **model_kwargs,
             )
@@ -690,6 +723,7 @@ class CustomGenerationMixin(GenerationMixin):
         streamer: Optional["BaseStreamer"] = None,
         rescale_config: Optional[RescaleConfig] = None,
         return_importance_details: bool = False,
+        use_fa_decode: bool = False,
         **model_kwargs,
     ) -> Union[GenerateDecoderOnlyOutput, GenerateEncoderDecoderOutput, torch.LongTensor, Dict[str, Any]]:
         r"""
@@ -751,6 +785,11 @@ class CustomGenerationMixin(GenerationMixin):
 
         assert rescale_config is not None
         selected_heads = rescale_config.selected_heads
+        # Group QRHeads by layer for the FA spec/warmup path (used when
+        # use_fa_decode=True). Empty dict otherwise -- not referenced.
+        qrhead_indices_by_layer = {}
+        for _l, _h in selected_heads:
+            qrhead_indices_by_layer.setdefault(_l, []).append(_h)
         context_warmup_steps = rescale_config.context_warmup_steps
         intervention_warmup_steps = rescale_config.intervention_warmup_steps
         decay_factor = rescale_config.decay_factor
@@ -817,14 +856,28 @@ class CustomGenerationMixin(GenerationMixin):
                 past_token_importance = torch.zeros_like(input_ids)
             # in context warmup stage, only get the attention weights, still reading the context
             elif cur_len < intervention_start_len:
-                outputs = model_forward(
-                        **model_inputs,
-                        compute_logits=False,
-                        output_attentions=True,
-                        return_dict=True,
-                    )
-                attention_peak = outputs.attentions
-                cur_token_importance = _aggregate_head_attention(attention_peak, selected_heads)
+                if use_fa_decode:
+                    # FA forward + per-layer QRHead snapshot; cache updates normally.
+                    qrhead_snapshot = {}
+                    outputs = model_forward(
+                            **model_inputs,
+                            compute_logits=False,
+                            output_attentions=False,
+                            return_dict=True,
+                            use_fa_decode=True,
+                            qrhead_indices_in_layer_dict=qrhead_indices_by_layer,
+                            qrhead_snapshot_buffer=qrhead_snapshot,
+                        )
+                    cur_token_importance = _aggregate_from_snapshot(qrhead_snapshot, selected_heads)
+                else:
+                    outputs = model_forward(
+                            **model_inputs,
+                            compute_logits=False,
+                            output_attentions=True,
+                            return_dict=True,
+                        )
+                    attention_peak = outputs.attentions
+                    cur_token_importance = _aggregate_head_attention(attention_peak, selected_heads)
 
                 if return_importance_details:
                     per_token_importance = {}
@@ -838,17 +891,35 @@ class CustomGenerationMixin(GenerationMixin):
             else:
                 if dynamic_rescale:
                     # SPECULATIVE PASS; skip updating the past key value
-                    outputs = model_forward(
-                        **model_inputs,
-                        attention_logits_intervention_vector=None,
-                        compute_logits=False,
-                        output_attentions=True,
-                        skip_update_past_key_value=True,
-                        layer_early_stopping=max_selected_layer,
-                        return_dict=True,
-                    )
-                    attention_peak = outputs.attentions
-                    cur_token_importance = _aggregate_head_attention(attention_peak, selected_heads)
+                    if use_fa_decode:
+                        # FA partial forward + per-layer QRHead snapshot; cache
+                        # untouched via the non-mutating cat path.
+                        qrhead_snapshot = {}
+                        outputs = model_forward(
+                            **model_inputs,
+                            attention_logits_intervention_vector=None,
+                            compute_logits=False,
+                            output_attentions=False,
+                            skip_update_past_key_value=True,
+                            layer_early_stopping=max_selected_layer,
+                            return_dict=True,
+                            use_fa_decode=True,
+                            qrhead_indices_in_layer_dict=qrhead_indices_by_layer,
+                            qrhead_snapshot_buffer=qrhead_snapshot,
+                        )
+                        cur_token_importance = _aggregate_from_snapshot(qrhead_snapshot, selected_heads)
+                    else:
+                        outputs = model_forward(
+                            **model_inputs,
+                            attention_logits_intervention_vector=None,
+                            compute_logits=False,
+                            output_attentions=True,
+                            skip_update_past_key_value=True,
+                            layer_early_stopping=max_selected_layer,
+                            return_dict=True,
+                        )
+                        attention_peak = outputs.attentions
+                        cur_token_importance = _aggregate_head_attention(attention_peak, selected_heads)
                     
                     if return_importance_details:
                         per_token_importance = {}
@@ -865,9 +936,13 @@ class CustomGenerationMixin(GenerationMixin):
                     # selected_mask,
                     if not static_mask_initialized:
                         static_mask_initialized = True
-                        
+
                         generation_logging["num_generations"] += 1
                         selected_mask = _select_important_tokens(past_token_importance, generation_logging, selection_method, top_tokens, top_percentile)
+                        # Anchor selected_mask to input_ids.device so the rest of the
+                        # static path (torch.cat below, _build_intervention_vector
+                        # which uses input_ids as reference_tensor) stays single-device.
+                        selected_mask = selected_mask.to(input_ids.device)
                     # extend selected mask to the length of the input ids
                     selected_mask = torch.cat([selected_mask, torch.zeros(batch_size, 1, dtype=torch.bool, device=input_ids.device)], dim=1)
                     attention_logits_intervention_vector = _build_intervention_vector(selected_mask, input_ids, strength, template_sequence_mask, dtype=past_token_importance.dtype)
@@ -879,6 +954,7 @@ class CustomGenerationMixin(GenerationMixin):
                     attention_logits_intervention_vector=attention_logits_intervention_vector,
                     output_attentions=False,
                     return_dict=True,
+                    use_fa_decode=use_fa_decode,
                 )
                 if return_importance_details:
                     per_token_importance["context_scores"] = past_token_importance.cpu()
