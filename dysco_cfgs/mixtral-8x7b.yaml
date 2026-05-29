@@ -1,0 +1,17 @@
+selected_heads: "[(16,12),(15,7),(16,22),(15,8),(16,7),(15,1),(19,9),(15,16),(16,29),(18,22),(15,17),(15,26),(18,11),(28,15),(17,0),(16,21)]"
+top_k: 4096
+top_p: 0.975
+strength: 2.0
+decay_factor: 0.75
+context_warmup_steps: 8
+intervention_warmup: 4  # len([/INST]) = 4 tokens; 'auto' yields 0 for Mixtral because [/INST] is embedded in the user message rather than appended by add_generation_prompt. Set explicitly to mirror the trailing-scaffold skip used by Llama/Qwen3.
+scale_template_tokens: False
+
+# model related constants
+template_sequences:
+  - [1]                              # <s>
+  - [733, 16289, 28793]              # [INST]
+  - [733, 28748, 16289, 28793]       # [/INST]
+  - [2]                              # </s>
+
+dynamic_rescale: True
