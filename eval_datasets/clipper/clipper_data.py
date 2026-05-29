@@ -7,13 +7,12 @@ from .clipper_utils import evaluate_clipper_single, parse_clipper_answer
 
 def post_process(output, example):
     """
-    Evaluate CLIPPER output against expected label.
+    Evaluate one CLIPPER output against expected label.
 
-    CLIPPER uses paired evaluation: each TRUE sample is paired with its corresponding
-    FALSE sample (by position). A pair is only correct when TRUE answer is "true"
+    CLIPPER uses paired evaluation is in run_eval.py: 
+    each TRUE sample is paired with its corresponding FALSE sample 
+    (by position). A pair is only correct when TRUE answer is "true"
     AND FALSE answer is "false".
-
-    Individual sample metrics are still computed for analysis.
 
     Args:
         output: Model generated text
@@ -73,13 +72,14 @@ def load_clipper_data(dataset_name: str, path: str):
     The suffix indicates approximate context length.
     """
 
-    assert dataset_name in ["clipper", "clipper_sp1", "clipper_sp2"]
+    _VALID_CLIPPER = ["clipper", "clipper_sp1", "clipper_sp2", "clipper_sp1_1", "clipper_sp1_2", "clipper_sp2_1", "clipper_sp2_2"]
+    assert dataset_name in _VALID_CLIPPER, f"Unknown clipper dataset: {dataset_name}, expected one of {_VALID_CLIPPER}"
 
     # Load pre-subsampled data: [{"data": sample, "label": True/False}, ...]
-    if dataset_name == "clipper_sp1":
-        data_path = os.path.join(path, "test-400_sp1.json")
-    elif dataset_name == "clipper_sp2":
-        data_path = os.path.join(path, "test-400_sp2.json")
+    # Map dataset name to file: clipper -> test-400.json, clipper_sp1 -> test-400_sp1.json, etc.
+    suffix = dataset_name.replace("clipper", "", 1)  # e.g. "_sp1_1" or ""
+    if suffix:
+        data_path = os.path.join(path, f"test-400{suffix}.json")
     else:
         data_path = os.path.join(path, "test-400.json")
     with open(data_path, "r", encoding="utf-8") as f:

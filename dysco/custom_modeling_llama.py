@@ -448,6 +448,10 @@ class RescaleLlamaAttention(nn.Module):
             attn_weights = attn_weights + causal_mask
 
         if attention_logits_intervention_vector is not None:
+            # Defensive: under device_map="auto" accelerate should migrate the
+            # kwarg via layer pre-hook, but enforce same-device explicitly.
+            if attention_logits_intervention_vector.device != attn_weights.device:
+                attention_logits_intervention_vector = attention_logits_intervention_vector.to(attn_weights.device)
             attn_weights = attn_weights + attention_logits_intervention_vector
         else:
             pass

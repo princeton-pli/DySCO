@@ -1,4 +1,5 @@
 # Adapted from transformers v4.57.3 for Qwen3 MoE with rescale support
+import math
 from typing import Callable, Optional, Union
 
 import torch
@@ -94,6 +95,10 @@ def eager_attention_forward(
 
     # Apply intervention vector for rescaling attention
     if attention_logits_intervention_vector is not None:
+        # Defensive: under device_map="auto" accelerate should migrate the
+        # kwarg via layer pre-hook, but enforce same-device explicitly.
+        if attention_logits_intervention_vector.device != attn_weights.device:
+            attention_logits_intervention_vector = attention_logits_intervention_vector.to(attn_weights.device)
         attn_weights = attn_weights + attention_logits_intervention_vector
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -264,6 +269,12 @@ class RescaleQwen3MoeAttention(nn.Module):
             not skip_update_past_key_value and
             not output_attentions):
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        # Sharpen attention via temperature scaling on Q/K (for attnsharp baseline)
+        attention_logits_temperature = kwargs.get("attention_logits_temperature", None)
+        if attention_logits_temperature is not None:
+            key_states = key_states / math.sqrt(attention_logits_temperature)
+            query_states = query_states / math.sqrt(attention_logits_temperature)
 
         attn_output, attn_weights = attention_interface(
             self,
