@@ -235,17 +235,29 @@ def _aggregate_from_snapshot(snapshot_buffer, selected_heads):
 
 
 def obtain_template_sequence_mask(input_ids, template_sequences):
-    """Build a boolean mask marking template token positions in input_ids."""
+    """Build a boolean mask marking template token positions in input_ids.
+
+    Fully vectorized: no per-position Python loop and no `if tensor:`
+    truthiness check.
+    """
     batch_size, max_length = input_ids.shape
     mask = torch.zeros_like(input_ids, dtype=torch.bool)
     for template in template_sequences:
         template = template.to(input_ids.device)
-        template_len = len(template)
-        for i in range(max_length - template_len + 1):
-            matches = torch.all(input_ids[:, i:i+template_len] == template.unsqueeze(0), dim=1)
-            for b in range(batch_size):
-                if matches[b]:
-                    mask[b, i:i+template_len] = True
+        T = len(template)
+        if T > max_length:
+            continue
+        # Sliding windows over input_ids -> view of shape (B, L-T+1, T); no copy.
+        windows = input_ids.unfold(1, T, 1)
+        # matches[b, i] is True iff input_ids[b, i:i+T] == template.
+        matches = (windows == template.view(1, 1, T)).all(dim=-1)
+        # For each True start position, expand to T consecutive positions and
+        # mark them True in one scatter (no Python iteration over positions).
+        offsets = torch.arange(T, device=input_ids.device)
+        for b in range(batch_size):  # always 1 in DySCO; kept for generality
+            starts = matches[b].nonzero(as_tuple=True)[0]            # (n_matches,) on GPU
+            positions = (starts.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
+            mask[b].index_fill_(0, positions, True)
     return mask
 
 
